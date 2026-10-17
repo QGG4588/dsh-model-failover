@@ -17,13 +17,13 @@
     "icon.svg"
   ],
   "license": "MIT",
-  "author": "DesRedTeam",
+  "author": "QGG4588",
   "engines": {
     "dsh": ">=0.2.1-rc.1 <0.3.0-0"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/DesRedTeam/dsh-model-failover.git"
+    "url": "https://github.com/QGG4588/dsh-model-failover-.git"
   },
   "keywords": [
     "dsh",
@@ -41,3 +41,5 @@
     }
   }
 }
+
+
