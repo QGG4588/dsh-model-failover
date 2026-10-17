@@ -78,6 +78,18 @@ model_failover set providers=["wb","agnes"]   → 池 = wb 全部模型 + agnes 
 model_failover status                          → 池 6 个候选：wb/cn:a, wb/cn:b, … agnes/global:x
 ```
 
+## 图形界面（输入框右下角）
+
+插件自带浏览器半边：在输入框右下角、官方「模型选择器」左侧有一个 **⇄ 故障转移** 按钮，
+点开后可以：
+
+- 勾选一个或多个供应商（池 = 所选供应商内的全部模型，实时显示每个供应商的模型数）
+- 保存 / 清空 / 停用·启用，点一下立即生效（与 `model_failover` 工具共用同一份状态）
+- 查看当前池大小与最近几次转移事件
+
+数据与操作走宿主同源路由 `GET /api/model-failover/status`、`POST /api/model-failover/{set,clear,toggle}`。
+新增/修改 Client 代码后需要重启 DSH 并刷新页面（桌面端不做热加载）。
+
 ## 与其它插件的协同
 
 - **dsh-llm-retry（官方）**：天然协同——上游先同供应商重试（自带退避），耗尽后本插件接住做跨供应商转移。

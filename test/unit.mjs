@@ -274,3 +274,107 @@ test("接线: 状态文件持久化（重启后快照兜底）", async () => {
   ]);
   process.env.DSH_HOME = home;
 });
+
+// ---------------------------------------------------------------------------
+// Web UI 路由（右下角面板后端）：status / set / clear / toggle
+// ---------------------------------------------------------------------------
+function fakeCtxWithWeb({ catalog } = {}) {
+  const hooks = new Map();
+  const routes = new Map();
+  const tools = { registered: [], register(t) { this.registered.push(t); } };
+  const fakeDefineTool = (spec) => ({ ...spec });
+  const webServer = {
+    register(route) { routes.set(route.path, route); },
+  };
+  const ctx = {
+    on(name, fn) { hooks.set(name, fn); return () => {}; },
+    inject(deps, fn) {
+      // 同时满足 tools / webServer 两个 inject 块
+      fn({
+        get(key) {
+          if (key === "tools") return tools;
+          if (key === "webServer") return webServer;
+          return undefined;
+        },
+      });
+    },
+    get(key) {
+      if (key === "sessionController") {
+        return { modelCatalog: catalog ? async () => catalog : undefined };
+      }
+      return undefined;
+    },
+    logger: { info() {}, warn() {} },
+    _hooks: hooks,
+    _routes: routes,
+    _tools: tools,
+  };
+  return { ctx, internals: { defineTool: fakeDefineTool } };
+}
+
+function fakeRes() {
+  return {
+    status: 0,
+    body: "",
+    writeHead(code) { this.status = code; },
+    end(s) { this.body = s; },
+  };
+}
+
+async function callRoute(ctx, path, { method = "GET", body } = {}) {
+  const route = ctx._routes.get(path);
+  assert.ok(route, `route ${path} 应注册`);
+  const req = {
+    method,
+    async *[Symbol.asyncIterator]() { if (body !== undefined) yield Buffer.from(JSON.stringify(body)); },
+  };
+  const res = fakeRes();
+  await route.handler(req, res);
+  return { status: res.status, json: JSON.parse(res.body || "{}") };
+}
+
+test("Web UI: status 返回目录/池/事件", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  await mod.apply(ctx, {}, internals);
+  const { status, json } = await callRoute(ctx, "/api/model-failover/status");
+  assert.equal(status, 200);
+  assert.equal(json.ok, true);
+  assert.deepEqual(json.providersCatalog.map((p) => p.id), ["wb", "agnes"]);
+  assert.equal(json.providersCatalog[0].models, 2);
+});
+
+test("Web UI: set 生效并回传池", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  await mod.apply(ctx, {}, internals);
+  const { status, json } = await callRoute(ctx, "/api/model-failover/set", { method: "POST", body: { providers: ["wb"] } });
+  assert.equal(status, 200);
+  assert.deepEqual(json.providers, ["wb"]);
+  assert.deepEqual(json.pool, [
+    { provider: "wb", model: "cn:a" },
+    { provider: "wb", model: "cn:b" },
+  ]);
+  // 后续 status 读到的是同一份状态
+  const snap = await callRoute(ctx, "/api/model-failover/status");
+  assert.deepEqual(snap.json.providers, ["wb"]);
+});
+
+test("Web UI: toggle / clear", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  await mod.apply(ctx, {}, internals);
+  const off = await callRoute(ctx, "/api/model-failover/toggle", { method: "POST", body: { enabled: false } });
+  assert.equal(off.json.enabled, false);
+  assert.equal(off.json.runtimeDisabled, true);
+  const on = await callRoute(ctx, "/api/model-failover/toggle", { method: "POST", body: { enabled: true } });
+  assert.equal(on.json.enabled, true);
+  await callRoute(ctx, "/api/model-failover/set", { method: "POST", body: { providers: ["agnes"] } });
+  const cleared = await callRoute(ctx, "/api/model-failover/clear", { method: "POST", body: {} });
+  assert.deepEqual(cleared.json.providers, []);
+  assert.deepEqual(cleared.json.pool, []);
+});
+
+test("Web UI: 非 POST 拒绝（405）", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  await mod.apply(ctx, {}, internals);
+  const { status } = await callRoute(ctx, "/api/model-failover/set", { method: "GET" });
+  assert.equal(status, 405);
+});

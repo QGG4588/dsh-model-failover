@@ -1,16 +1,18 @@
 {
   "name": "dsh-model-failover",
-  "version": "1.0.0",
-  "description": "Model failover for DeepSeek Harness: pool = all models of selected providers (one or many); on request failure (RATE_LIMIT/QUOTA/TIMEOUT/...) auto-switch to the next untried model in the pool and retry. Runtime control via the model_failover tool (status/set/clear/enable/disable).",
+  "version": "1.1.0",
+  "description": "Model failover for DeepSeek Harness with a Web UI seat beside the composer model picker: pick one or more providers, pool = all models inside them; on request failure (RATE_LIMIT/QUOTA/TIMEOUT/...) auto-retry with the next untried model. Runtime tool model_failover (status/set/clear/enable/disable) plus an in-page panel.",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "client.js",
     "cordis.patch.yml",
     "locale/en.json",
     "locale/zh.json",
@@ -38,9 +40,15 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
     }
   }
 }
+
 
 
 

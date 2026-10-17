@@ -420,6 +420,115 @@ export async function apply(ctx, config = {}, internals = {}) {
       log("model_failover 工具已注册");
     });
   }
+  // ---------------------------------------------------------------------------
+  // Web UI 控制台（右下角模型选择器左侧的「故障转移」入口）：
+  // Client 半边（client.js）注册进 conversation.input.right，数据与操作走这组同源路由。
+  // 与 model_failover 工具共用同一份状态读写，不存在两套逻辑。
+  // ---------------------------------------------------------------------------
+  const sendJson = (res, status, body) => {
+    try {
+      res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(body));
+    } catch { /* 连接已断 → 忽略 */ }
+  };
+  const readJsonBody = async (req) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const raw = Buffer.concat(chunks).toString("utf8").trim();
+    return raw ? JSON.parse(raw) : {};
+  };
+  /** 组装给 UI 的快照（池 = 所选供应商全部模型）。 */
+  const uiSnapshot = async () => {
+    const state = readState();
+    const providerIds = (Array.isArray(state.providers) && state.providers.length > 0) ? state.providers : cfg.providers;
+    const groups = (await loadCatalog(ctx)) ?? [];
+    const pool = buildPool(groups, providerIds);
+    const providers = groups.map((g) => ({
+      id: String(g.id ?? ""),
+      name: String(g.name ?? g.id ?? ""),
+      models: Array.isArray(g.models) ? g.models.length : 0,
+    })).filter((p) => p.id.length > 0);
+    return {
+      ok: true,
+      enabled: cfg.enabled && !state.disabled,
+      configEnabled: cfg.enabled,
+      runtimeDisabled: state.disabled === true,
+      providers: providerIds,
+      configProviders: cfg.providers,
+      pool,
+      providersCatalog: providers,
+      sticky: cfg.sticky,
+      retryableCodes: cfg.retryableCodes,
+      maxFailoverAttempts: cfg.maxFailoverAttempts,
+      events: (state.events ?? []).slice(-5),
+    };
+  };
+  ctx.inject(["webServer"], (wctx) => {
+    const webServer = wctx.get("webServer");
+    if (!webServer?.register) return;
+    webServer.register({
+      kind: "exact",
+      path: "/api/model-failover/status",
+      handler: async (req, res) => {
+        try {
+          if ((req.method ?? "GET") !== "GET") return sendJson(res, 405, { ok: false, error: { code: "METHOD", message: "Method Not Allowed" } });
+          return sendJson(res, 200, await uiSnapshot());
+        } catch (error) {
+          return sendJson(res, 500, { ok: false, error: { code: "INTERNAL", message: String(error?.message ?? error) } });
+        }
+      },
+    });
+    webServer.register({
+      kind: "exact",
+      path: "/api/model-failover/set",
+      handler: async (req, res) => {
+        try {
+          if ((req.method ?? "POST") !== "POST") return sendJson(res, 405, { ok: false, error: { code: "METHOD", message: "Method Not Allowed" } });
+          const body = await readJsonBody(req);
+          const providers = (Array.isArray(body?.providers) ? body.providers : [])
+            .map((p) => String(p).trim()).filter(Boolean);
+          writeState({ ...readState(), providers });
+          invalidateStateCache();
+          return sendJson(res, 200, { ok: true, ...(await uiSnapshot()) });
+        } catch (error) {
+          return sendJson(res, 400, { ok: false, error: { code: "SET", message: String(error?.message ?? error) } });
+        }
+      },
+    });
+    webServer.register({
+      kind: "exact",
+      path: "/api/model-failover/clear",
+      handler: async (req, res) => {
+        try {
+          if ((req.method ?? "POST") !== "POST") return sendJson(res, 405, { ok: false, error: { code: "METHOD", message: "Method Not Allowed" } });
+          writeState({ ...readState(), providers: [], stickyOverrides: {} });
+          invalidateStateCache();
+          pendingBySession.clear();
+          return sendJson(res, 200, { ok: true, ...(await uiSnapshot()) });
+        } catch (error) {
+          return sendJson(res, 400, { ok: false, error: { code: "CLEAR", message: String(error?.message ?? error) } });
+        }
+      },
+    });
+    webServer.register({
+      kind: "exact",
+      path: "/api/model-failover/toggle",
+      handler: async (req, res) => {
+        try {
+          if ((req.method ?? "POST") !== "POST") return sendJson(res, 405, { ok: false, error: { code: "METHOD", message: "Method Not Allowed" } });
+          const body = await readJsonBody(req);
+          const enabled = body?.enabled !== false;
+          writeState({ ...readState(), disabled: !enabled });
+          invalidateStateCache();
+          return sendJson(res, 200, { ok: true, ...(await uiSnapshot()) });
+        } catch (error) {
+          return sendJson(res, 400, { ok: false, error: { code: "TOGGLE", message: String(error?.message ?? error) } });
+        }
+      },
+    });
+    log("Web UI 路由已注册 (/api/model-failover/status|set|clear|toggle)");
+  });
+
   log(`已接线（enabled=${cfg.enabled}, config池=${cfg.providers.length} 个供应商, sticky=${cfg.sticky}）`);
 }
 
