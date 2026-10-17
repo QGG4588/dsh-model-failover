@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Model Failover",
+    "description": "On model request failure, automatically retries with the next untried model from the selected providers' full model pools."
+  }
+}

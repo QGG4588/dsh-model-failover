@@ -1,0 +1,19 @@
+# dsh-model-failover — 模型故障自动转移（供应商池内轮询）
+#
+# 池 = 所选供应商（单个或多个）下的全部模型（来自官方 modelCatalog）。
+# 模型请求失败（RATE_LIMIT/QUOTA/TIMEOUT/SERVER/TRANSPORT 等可配置 code）时，
+# 自动切到池中下一个未试过的模型重试；池尽则交还原错误。
+#
+# 可选 config（全部有默认值）：
+#   enabled: true                  总开关
+#   providers: []                  默认供应商池（按顺序）；空 = 运行时用 model_failover 工具设置
+#   retryableCodes: [...]          触发转移的失败码（Harness 机器可路由 code）
+#   sticky: false                  转移后粘滞该会话（直到 clear）；false = 仅当次故障内转移
+#   maxFailoverAttempts: 0         单次故障最多转移几个候选（0 = 整个池子）
+#
+# 运行时控制（AI 工具，无需改配置重启）：
+#   model_failover status / set {providers} / clear / enable / disable
+- insert:
+    - id: dsh-model-failover
+      name: dsh-model-failover
+      config: {}

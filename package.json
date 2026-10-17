@@ -1,0 +1,43 @@
+{
+  "name": "dsh-model-failover",
+  "version": "1.0.0",
+  "description": "Model failover for DeepSeek Harness: pool = all models of selected providers (one or many); on request failure (RATE_LIMIT/QUOTA/TIMEOUT/...) auto-switch to the next untried model in the pool and retry. Runtime control via the model_failover tool (status/set/clear/enable/disable).",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/en.json",
+    "locale/zh.json",
+    "icon.svg"
+  ],
+  "license": "MIT",
+  "author": "DesRedTeam",
+  "engines": {
+    "dsh": ">=0.2.1-rc.1 <0.3.0-0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DesRedTeam/dsh-model-failover.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "model",
+    "failover",
+    "rotation",
+    "retry",
+    "provider-pool"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
