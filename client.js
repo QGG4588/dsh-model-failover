@@ -61,6 +61,7 @@ window.__ModuleLoader__.load({
       const [draft, setDraft] = React.useState([]);
       const [busy, setBusy] = React.useState(false);
       const [err, setErr] = React.useState('');
+      const [expanded, setExpanded] = React.useState([]);
 
       const refresh = React.useCallback(async () => {
         try {
@@ -90,6 +91,10 @@ window.__ModuleLoader__.load({
 
       const toggleProvider = (id) => {
         setDraft((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+      };
+
+      const toggleExpand = (id) => {
+        setExpanded((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
       };
 
       const enabled = !!(status && status.enabled);
