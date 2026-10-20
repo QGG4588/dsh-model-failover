@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-failover",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Model failover for DeepSeek Harness with a Web UI seat beside the composer model picker: pick one or more providers, pool = all models inside them; on request failure (RATE_LIMIT/QUOTA/TIMEOUT/...) auto-retry with the next untried model. Runtime tool model_failover (status/set/clear/enable/disable) plus an in-page panel.",
   "type": "module",
   "main": "index.js",
@@ -48,6 +48,7 @@
     }
   }
 }
+
 
 
 
