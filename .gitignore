@@ -5,3 +5,6 @@ state.json
 *.tmp
 
 *.tgz
+
+.auto-sync.ps1
+*.tgz
