@@ -33,6 +33,11 @@ window.__ModuleLoader__.load({
       '.mf_act.mf_primary{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}',
       '.mf_err{font-size:11px;color:var(--dsw-state-error-primary,#e5484d);white-space:pre-wrap}',
       '.mf_events{font-size:11px;color:var(--dsw-alias-label-tertiary);white-space:pre-wrap;line-height:15px;max-height:70px;overflow:auto;border-top:.5px dashed var(--dsw-alias-border-l2);padding-top:6px}',
+      '.mf_mrow{display:flex;align-items:center;gap:6px;font-size:11px;padding:2px 4px;border-radius:4px}',
+      '.mf_mrow:hover{background:var(--dsw-alias-bg-layer-2)}',
+      '.mf_mbadge{width:14px;text-align:center}',
+      '.mf_mname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}',
+      '.mf_mstat{font-size:10px;color:var(--dsw-alias-label-tertiary)}',
     ].join('');
 
     function api(path, body) {
@@ -117,6 +122,34 @@ window.__ModuleLoader__.load({
         return t + '  ' + (e.from || '?') + ' [' + (e.code || '?') + '] → ' + (e.to || '(池尽)');
       }).join('\n');
 
+      // 池内模型状态：🟢 今日可用 / 🔴 熔断冷却中 / ⚪ 未试
+      const circuits = (status && status.circuits) || {};
+      const success = (status && status.success) || {};
+      const nowTs = (status && status.now) || Date.now();
+      const pool = (status && status.pool) || [];
+      const policy = (status && status.circuitPolicy) || {};
+      const modelRows = pool.map((p) => {
+        const key = p.provider + '/' + p.model;
+        const c = circuits[key];
+        const ok = success[key] && nowTs - success[key].at < 86400000;
+        let badge = '⚪', stat = '';
+        if (c && c.until > nowTs) {
+          badge = '🔴';
+          stat = '熔断 ' + Math.max(0, Math.round((c.until - nowTs) / 1000)) + 's';
+        } else if (ok) {
+          badge = '🟢';
+          stat = '今日可用';
+        }
+        return h('div', { key, className: 'mf_mrow' },
+          h('span', { className: 'mf_mbadge' }, badge),
+          h('span', { className: 'mf_mname', title: key }, key),
+          h('span', { className: 'mf_mstat' }, stat),
+        );
+      });
+      const policyLine = policy.failureThreshold
+        ? '熔断：' + policy.failureThreshold + ' 次/' + Math.round((policy.burstWindowMs || 0) / 1000) + 's → 冷却 ' + Math.round((policy.circuitCooldownMs || 0) / 1000) + 's'
+        : '';
+
       const panel = h('div', { className: 'mf_root' },
         h('style', null, CSS),
         h('div', { className: 'mf_mask', onClick: () => setOpen(false) }),
@@ -132,6 +165,8 @@ window.__ModuleLoader__.load({
             '勾选供应商：池 = 所选供应商内的全部模型。请求失败（限流/配额/超时/5xx/传输）时自动切到池中下一个未试过的模型。',
           ),
           rows.length > 0 ? h('div', { className: 'mf_list' }, rows) : h('div', { className: 'mf_hint' }, '模型目录暂不可用（稍后重开面板重试）'),
+          pool.length > 0 ? h('div', { className: 'mf_list' }, modelRows) : null,
+          policyLine ? h('div', { className: 'mf_hint' }, policyLine) : null,
           h('div', { className: 'mf_actions' },
             h('button', {
               type: 'button',

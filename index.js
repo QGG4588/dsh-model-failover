@@ -192,6 +192,88 @@ export function applyRoute(resolved, target) {
 }
 
 // ---------------------------------------------------------------------------
+// 熔断器（借鉴同名项目的两级熔断）：模型级失败阈值 → 冷却；同供应商多个模型熔断 → 供应商级
+// 状态持久化在 state.json 的 circuits / success（重启后冷却仍有效）。
+// ---------------------------------------------------------------------------
+const CIRCUIT_MESSAGE_MAX = 400;
+
+/** 路由键 provider/model。 */
+export function circuitKey(provider, model) {
+  return `${provider}/${model}`;
+}
+
+/** 熔断是否仍在生效（until > now）。 */
+export function isCircuitOpen(circuit, now) {
+  return !!(circuit && Number.isFinite(circuit.until) && circuit.until > now);
+}
+
+/** 清理已过冷却期的熔断记录（返回是否有改动）。 */
+export function pruneExpiredCircuits(state, now) {
+  const circuits = state?.circuits ?? {};
+  let changed = false;
+  for (const [k, v] of Object.entries(circuits)) {
+    if (v && Number.isFinite(v.until) && v.until <= now) {
+      delete circuits[k];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * 记录一次模型失败并（按阈值）打开熔断。
+ * @returns {{opened: boolean, failures: number}}
+ */
+export function noteFailureInState(state, cfg, provider, model, failure, now, pool) {
+  const key = circuitKey(provider, model);
+  const prev = state.circuits?.[key];
+  const inWindow = prev && Number.isFinite(prev.firstAt) && now - prev.firstAt <= cfg.burstWindowMs;
+  const failures = (inWindow ? (prev.failures ?? 0) : 0) + 1;
+  const entry = {
+    failures,
+    firstAt: inWindow ? prev.firstAt : now,
+    lastAt: now,
+    code: String(failure?.code ?? "UNKNOWN"),
+    message: String(failure?.message ?? "").slice(0, CIRCUIT_MESSAGE_MAX),
+  };
+  if (failures >= cfg.failureThreshold) entry.until = now + cfg.circuitCooldownMs;
+  state.circuits = { ...(state.circuits ?? {}), [key]: entry };
+  // 平台级：同一供应商下处于熔断的模型数达到阈值 → 给该供应商池内全部模型加冷却
+  const openUnderProvider = Object.entries(state.circuits)
+    .filter(([k, v]) => k.split("/")[0] === provider && isCircuitOpen(v, now))
+    .length;
+  if (openUnderProvider >= cfg.providerThreshold) {
+    for (const route of pool ?? []) {
+      if (route.provider !== provider) continue;
+      const k = circuitKey(route.provider, route.model);
+      const cur = state.circuits[k] ?? entry;
+      state.circuits[k] = {
+        ...cur,
+        code: cur.code ?? "PLATFORM",
+        message: cur.message ?? `provider-wide circuit: ${provider}`,
+        until: Math.max(Number(cur.until) || 0, now + cfg.circuitCooldownMs),
+      };
+    }
+  }
+  return { opened: isCircuitOpen(state.circuits[key], now), failures };
+}
+
+/** 记录一次成功：清除该路由熔断，打上“今日可用”标记。 */
+export function noteSuccessInState(state, provider, model, now) {
+  const key = circuitKey(provider, model);
+  if (state.circuits && state.circuits[key]) delete state.circuits[key];
+  state.success = { ...(state.success ?? {}), [key]: { at: now } };
+}
+
+/** 从池中挑第一个「未试过且未熔断」的候选；全部熔断时退化为按序尝试（不把用户卡死）。 */
+export function pickHealthyRoute(pool, tried, state, cfg, now) {
+  const circuits = state?.circuits ?? {};
+  const untried = (pool ?? []).filter((p) => !(tried ?? new Set()).has(circuitKey(p.provider, p.model)));
+  const healthy = untried.find((p) => !isCircuitOpen(circuits[circuitKey(p.provider, p.model)], now));
+  return healthy ?? untried[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // 插件主体
 // ---------------------------------------------------------------------------
 /**
@@ -211,6 +293,18 @@ export async function apply(ctx, config = {}, internals = {}) {
     maxFailoverAttempts: Number.isFinite(config?.maxFailoverAttempts) && config.maxFailoverAttempts > 0
       ? Math.floor(config.maxFailoverAttempts)
       : 0,
+    // 熔断（借鉴同名的两级熔断实现）：突发窗口内失败达到阈值 → 该路由熔断冷却；
+    // 同一供应商下多个模型同时熔断 → 该供应商整体短时熔断（平台级故障）。
+    failureThreshold: Number.isFinite(config?.failureThreshold) && config.failureThreshold > 0
+      ? Math.floor(config.failureThreshold) : 2,
+    burstWindowMs: Number.isFinite(config?.burstWindowMs) && config.burstWindowMs > 0
+      ? Math.floor(config.burstWindowMs) : 300000,
+    circuitCooldownMs: Number.isFinite(config?.circuitCooldownMs) && config.circuitCooldownMs >= 0
+      ? Math.floor(config.circuitCooldownMs) : 60000,
+    providerThreshold: Number.isFinite(config?.providerThreshold) && config.providerThreshold > 0
+      ? Math.floor(config.providerThreshold) : 2,
+    // 主动绕行：请求命中已熔断路由时直接改道到池中第一个健康模型（不必再失败一次）
+    preemptiveSwitch: config?.preemptiveSwitch !== false,
   };
   const log = (msg) => {
     try {
@@ -241,6 +335,30 @@ export async function apply(ctx, config = {}, internals = {}) {
         } else if (cfg.sticky) {
           const stickyTarget = state.stickyOverrides?.[sessionId];
           if (stickyTarget?.provider && stickyTarget?.model) outbound = applyRoute(resolved, stickyTarget);
+        }
+        // 主动绕行：出站路由已熔断 → 直接改道池中第一个健康模型（不必再失败一次）
+        if (cfg.preemptiveSwitch) {
+          const now = Date.now();
+          pruneExpiredCircuits(state, now);
+          const providerIds = (Array.isArray(state.providers) && state.providers.length > 0)
+            ? state.providers
+            : cfg.providers;
+          if (providerIds.length > 0) {
+            const groups = await loadCatalog(ctx);
+            const pool = groups ? buildPool(groups, providerIds) : [];
+            const key = circuitKey(outbound.provider, outbound.model);
+            if (pool.length > 0 && isCircuitOpen(state.circuits?.[key], now)) {
+              const healthy = pickHealthyRoute(pool, new Set([key]), state, cfg, now);
+              if (healthy && !isCircuitOpen(state.circuits?.[circuitKey(healthy.provider, healthy.model)], now)) {
+                recordEvent(ctx, {
+                  sessionId, from: key, to: circuitKey(healthy.provider, healthy.model),
+                  code: "PREEMPTIVE", outcome: "preemptive",
+                });
+                log(`主动绕行：${key} 处于熔断冷却，改道 ${circuitKey(healthy.provider, healthy.model)}`);
+                outbound = applyRoute(outbound, healthy);
+              }
+            }
+          }
         }
       }
       lastRouteBySession.set(sessionId, {
@@ -294,6 +412,17 @@ export async function apply(ctx, config = {}, internals = {}) {
         const last = lastRouteBySession.get(sessionId);
         failedModel = (last && last.turn === turn && last.step === step) ? last.model : undefined;
       }
+      // 熔断记账：失败计数 → 达到阈值即冷却该路由（供应商级同理）
+      const now = Date.now();
+      pruneExpiredCircuits(state, now);
+      const modelForCircuit = failedModel ?? "*";
+      const failureRec = noteFailureInState(state, cfg, provider, modelForCircuit, failure, now, pool);
+      writeState(state);
+      invalidateStateCache();
+      if (failureRec.opened) {
+        recordEvent(ctx, { sessionId, from: `${provider}/${modelForCircuit}`, to: null, code: failure.code, outcome: "circuit-open" });
+        log(`熔断：${provider}/${modelForCircuit} 失败 ${failureRec.failures} 次，冷却 ${cfg.circuitCooldownMs}ms`);
+      }
       const cur = pendingBySession.get(sessionId);
       const sameSeries = cur && cur.turn === turn && cur.step === step;
       const tried = sameSeries ? cur.tried : new Set();
@@ -301,7 +430,7 @@ export async function apply(ctx, config = {}, internals = {}) {
       const switchCount = sameSeries ? cur.switchCount : 0;
       const cap = cfg.maxFailoverAttempts > 0 ? cfg.maxFailoverAttempts : pool.length;
       if (switchCount >= cap) return downstream;
-      const candidate = pool.find((p) => !tried.has(`${p.provider}/${p.model}`));
+      const candidate = pickHealthyRoute(pool, tried, state, cfg, now);
       if (!candidate) {
         pendingBySession.delete(sessionId);
         recordEvent(ctx, { sessionId, from: `${provider}/${failedModel ?? "?"}`, to: null, code: failure.code, outcome: "pool-exhausted" });
@@ -324,6 +453,32 @@ export async function apply(ctx, config = {}, internals = {}) {
       log(`故障转移处理异常（不干预本次）: ${String(error?.message ?? error)}`);
       return downstream;
     }
+  });
+
+  // llm/stream：只观察不改写 —— 终态 finish 为成功时记录「今日可用」并清除该路由熔断。
+  ctx.on("llm/stream", async (options, next) => {
+    const stream = await next();
+    if (!cfg.enabled || !options?.provider || !options?.model) return stream;
+    const provider = String(options.provider);
+    const model = String(options.model);
+    return (async function* () {
+      for await (const chunk of stream) {
+        try {
+          if (chunk && chunk.type === "finish") {
+            const kind = chunk.reason?.kind;
+            if (kind !== "error" && kind !== "aborted") {
+              const s = readState();
+              if (!s.disabled) {
+                noteSuccessInState(s, provider, model, Date.now());
+                writeState(s);
+                invalidateStateCache();
+              }
+            }
+          }
+        } catch { /* 观测失败不影响数据流 */ }
+        yield chunk;
+      }
+    })();
   });
 
   // 防泄漏：pending/lastRoute 超过 512 个会话时清理 1 小时前的旧条目
@@ -372,6 +527,15 @@ export async function apply(ctx, config = {}, internals = {}) {
               ? "未配置（故障转移不生效）"
               : `${providerIds.join(" → ")}（${pool.length} 个候选模型${groups ? "" : "，目录不可用仅剩快照"}）`;
             const stickyCount = Object.keys(state.stickyOverrides ?? {}).length;
+            const now = Date.now();
+            pruneExpiredCircuits(state, now);
+            const openCircuits = Object.entries(state.circuits ?? {}).filter(([, v]) => isCircuitOpen(v, now));
+            const circuitDesc = openCircuits.length === 0
+              ? "熔断：无"
+              : "熔断：" + openCircuits.map(([k, v]) => {
+                const left = Math.max(0, Math.round((v.until - now) / 1000));
+                return `  - ${k}（${v.code}，剩余 ${left}s，失败 ${v.failures} 次）`;
+              }).join("\n");
             const events = (state.events ?? []).slice(-8).reverse()
               .map((e) => `  - ${new Date(e.time).toLocaleString("zh-CN")} ${e.sessionId?.slice(0, 12)}… ${e.from} [${e.code}] → ${e.to ?? "(池尽)"} ${e.outcome}`)
               .join("\n");
@@ -381,6 +545,8 @@ export async function apply(ctx, config = {}, internals = {}) {
               `触发码：${cfg.retryableCodes.join(", ")}`,
               `粘滞模式：${cfg.sticky ? `开（${stickyCount} 个会话有粘滞目标）` : "关（仅当次故障内转移）"}`,
               `单次故障转移上限：${cfg.maxFailoverAttempts > 0 ? cfg.maxFailoverAttempts : "整个池子"}`,
+              `熔断策略：失败 ${cfg.failureThreshold} 次/${Math.round(cfg.burstWindowMs / 1000)}s 内 → 冷却 ${Math.round(cfg.circuitCooldownMs / 1000)}s；同供应商 ${cfg.providerThreshold} 个模型熔断 → 整家冷却`,
+              circuitDesc,
               events ? `最近事件：\n${events}` : "最近事件：（无）",
             ].join("\n");
           }
@@ -437,9 +603,11 @@ export async function apply(ctx, config = {}, internals = {}) {
     const raw = Buffer.concat(chunks).toString("utf8").trim();
     return raw ? JSON.parse(raw) : {};
   };
-  /** 组装给 UI 的快照（池 = 所选供应商全部模型）。 */
+  /** 组装给 UI 的快照（池 = 所选供应商全部模型；含熔断与今日可用状态）。 */
   const uiSnapshot = async () => {
     const state = readState();
+    const now = Date.now();
+    pruneExpiredCircuits(state, now);
     const providerIds = (Array.isArray(state.providers) && state.providers.length > 0) ? state.providers : cfg.providers;
     const groups = (await loadCatalog(ctx)) ?? [];
     const pool = buildPool(groups, providerIds);
@@ -450,6 +618,7 @@ export async function apply(ctx, config = {}, internals = {}) {
     })).filter((p) => p.id.length > 0);
     return {
       ok: true,
+      now,
       enabled: cfg.enabled && !state.disabled,
       configEnabled: cfg.enabled,
       runtimeDisabled: state.disabled === true,
@@ -460,6 +629,15 @@ export async function apply(ctx, config = {}, internals = {}) {
       sticky: cfg.sticky,
       retryableCodes: cfg.retryableCodes,
       maxFailoverAttempts: cfg.maxFailoverAttempts,
+      circuits: Object.fromEntries(Object.entries(state.circuits ?? {}).filter(([, v]) => isCircuitOpen(v, now))),
+      success: state.success ?? {},
+      circuitPolicy: {
+        failureThreshold: cfg.failureThreshold,
+        burstWindowMs: cfg.burstWindowMs,
+        circuitCooldownMs: cfg.circuitCooldownMs,
+        providerThreshold: cfg.providerThreshold,
+        preemptiveSwitch: cfg.preemptiveSwitch,
+      },
       events: (state.events ?? []).slice(-5),
     };
   };
@@ -544,3 +722,8 @@ function recordEvent(ctx, event) {
 
 // 纯逻辑导出（单测用）
 export const _internals = { DEFAULT_RETRYABLE_CODES, applyRoute, buildPool, isRetryable };
+
+/** 测试钩子：清空状态缓存（单测在场景之间调用，避免上一条用例的熔断状态串台）。 */
+export function resetStateCacheForTest() {
+  stateCache = { mtimeMs: -1, size: -1, state: null };
+}

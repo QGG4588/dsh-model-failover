@@ -1,12 +1,18 @@
 // dsh-model-failover 单元测试（工作区自测：无宿主依赖，伪 ctx 驱动真实 apply 接线）
 // 覆盖：buildPool / isRetryable / applyRoute 纯逻辑 + agent/request-error → agent/request 全链路
 import { test } from "node:test";
+import { test as _t, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-failover-test-"));
+
+beforeEach(() => {
+  try { fs.rmSync(path.join(process.env.DSH_HOME, "model-failover", "state.json"), { force: true }); } catch {}
+  mod.resetStateCacheForTest?.();
+});
 
 const mod = await import("../index.js");
 const { buildPool, isRetryable, applyRoute, _internals } = mod;
@@ -377,4 +383,76 @@ test("Web UI: 非 POST 拒绝（405）", async () => {
   await mod.apply(ctx, {}, internals);
   const { status } = await callRoute(ctx, "/api/model-failover/set", { method: "GET" });
   assert.equal(status, 405);
+});
+
+
+// ---------------------------------------------------------------------------
+// 熔断器（借鉴同名项目的两级熔断）
+// ---------------------------------------------------------------------------
+async function failOnce(ctx, session, provider, model, { turn = 1, step = 1, code = "RATE_LIMIT" } = {}) {
+  const reqHook = ctx._hooks.get("agent/request");
+  await reqHook({ agent: session.agent, turn, step }, async () => ({ provider, model }));
+  const errHook = ctx._hooks.get("agent/request-error");
+  return errHook({ agent: session.agent, provider, failure: { message: "boom", code }, turn, step }, async () => undefined);
+}
+
+test("熔断: 达到阈值后路由冷却且 status 可见", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  const session = freshSession();
+  await mod.apply(ctx, { providers: ["wb", "agnes"], failureThreshold: 1, circuitCooldownMs: 60000 }, internals);
+  await failOnce(ctx, session, "wb", "cn:a");
+  const { json } = await callRoute(ctx, "/api/model-failover/status");
+  assert.ok(json.circuits["wb/cn:a"], "wb/cn:a 应进入熔断");
+  assert.ok(json.circuits["wb/cn:a"].until > json.now, "冷却时间应晚于现在");
+});
+
+test("主动绕行: 命中熔断路由时直接改道健康模型", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  const session = freshSession();
+  await mod.apply(ctx, { providers: ["wb", "agnes"], failureThreshold: 1, circuitCooldownMs: 60000, preemptiveSwitch: true }, internals);
+  await failOnce(ctx, session, "wb", "cn:a");
+  const reqHook = ctx._hooks.get("agent/request");
+  const resolved = await reqHook({ agent: session.agent, turn: 2, step: 1 }, async () => ({ provider: "wb", model: "cn:a" }));
+  assert.deepEqual(resolved, { provider: "wb", model: "cn:b" });
+});
+
+test("冷却过期后恢复使用原路由", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  const session = freshSession();
+  await mod.apply(ctx, { providers: ["wb"], failureThreshold: 1, circuitCooldownMs: 60000, preemptiveSwitch: true }, internals);
+  // 直接写一条已过期的熔断记录
+  fs.mkdirSync(path.join(process.env.DSH_HOME, "model-failover"), { recursive: true });
+  fs.writeFileSync(path.join(process.env.DSH_HOME, "model-failover", "state.json"), JSON.stringify({
+    providers: ["wb"],
+    circuits: { "wb/cn:a": { failures: 1, firstAt: Date.now() - 120000, lastAt: Date.now() - 120000, until: Date.now() - 60000, code: "RATE_LIMIT" } },
+  }));
+  mod.resetStateCacheForTest();
+  const reqHook = ctx._hooks.get("agent/request");
+  const resolved = await reqHook({ agent: session.agent, turn: 1, step: 1 }, async () => ({ provider: "wb", model: "cn:a" }));
+  assert.deepEqual(resolved, { provider: "wb", model: "cn:a" }, "冷却过期后不应改道");
+});
+
+test("平台级熔断: 同供应商多个模型熔断", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  const session = freshSession();
+  await mod.apply(ctx, { providers: ["wb"], failureThreshold: 1, providerThreshold: 2, circuitCooldownMs: 60000 }, internals);
+  await failOnce(ctx, session, "wb", "cn:a", { step: 1 });
+  await failOnce(ctx, session, "wb", "cn:b", { step: 2 });
+  const { json } = await callRoute(ctx, "/api/model-failover/status");
+  assert.ok(json.circuits["wb/cn:a"] && json.circuits["wb/cn:b"], "两个模型都应熔断");
+});
+
+test("llm/stream: 成功 finish 记录今日可用", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  await mod.apply(ctx, { providers: ["wb"] }, internals);
+  const llmHook = ctx._hooks.get("llm/stream");
+  assert.ok(llmHook, "llm/stream 观察者应注册");
+  const stream = await llmHook({ provider: "wb", model: "cn:a" }, async () => (async function* () {
+    yield { type: "finish", reason: { kind: "stop" } };
+  })());
+  const chunks = [];
+  for await (const c of stream) chunks.push(c);
+  assert.equal(chunks.length, 1);
+  const { json } = await callRoute(ctx, "/api/model-failover/status");
+  assert.ok(json.success["wb/cn:a"], "成功路由应标记可用");
 });

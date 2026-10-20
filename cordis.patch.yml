@@ -10,6 +10,11 @@
 #   retryableCodes: [...]          触发转移的失败码（Harness 机器可路由 code）
 #   sticky: false                  转移后粘滞该会话（直到 clear）；false = 仅当次故障内转移
 #   maxFailoverAttempts: 0         单次故障最多转移几个候选（0 = 整个池子）
+#   failureThreshold: 2            熔断：窗口内失败几次触发冷却
+#   burstWindowMs: 300000          熔断：失败计数窗口（毫秒）
+#   circuitCooldownMs: 60000       熔断：冷却时长（毫秒）
+#   providerThreshold: 2           平台级熔断：同供应商几个模型熔断 → 整家冷却
+#   preemptiveSwitch: true         主动绕行：命中熔断路由时直接改道健康模型
 #
 # 运行时控制（AI 工具，无需改配置重启）：
 #   model_failover status / set {providers} / clear / enable / disable
@@ -17,3 +22,4 @@
     - id: dsh-model-failover
       name: dsh-model-failover
       config: {}
+

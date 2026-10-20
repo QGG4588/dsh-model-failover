@@ -62,6 +62,17 @@ dsh-model-failover/
 | `sticky` | `false` | 转移后粘滞该会话直到 `clear`；false = 仅当次故障内转移 |
 | `maxFailoverAttempts` | `0` | 单次故障最多转移几个候选（0 = 整个池子） |
 
+## 熔断（抗抖动）
+
+单个模型偶发失败不立刻拉黑，但持续失败会被"熔断"一段时间，避免每次请求都先撞一遍坏模型：
+
+- **模型级**：`failureThreshold`（默认 2）次失败发生在 `burstWindowMs`（默认 300s）窗口内 → 该路由冷却 `circuitCooldownMs`（默认 60s），期间池候选自动跳过它；
+- **供应商级**：同一供应商下已有 `providerThreshold`（默认 2）个模型同时熔断 → 该供应商池内全部模型一起冷却（整个平台挂掉时不再逐个撞）；
+- **主动绕行**：请求命中已熔断路由时，`agent/request` 直接改道到池中第一个健康模型，不必再失败一次（`preemptiveSwitch`，默认开）；
+- **自动恢复**：冷却到期自动复活；`llm/stream` 观察到成功终态时清除该路由熔断并打上"今日可用"标记；
+- 全部候选都在熔断时仍按池顺序尝试（不把用户卡死）。
+
+状态持久化在 `state.json` 的 `circuits` / `success`，重启后冷却仍有效。
 ## 运行时工具 `model_failover`
 
 | action | 参数 | 作用 |
@@ -85,7 +96,7 @@ model_failover status                          → 池 6 个候选：wb/cn:a, wb
 
 - 勾选一个或多个供应商（池 = 所选供应商内的全部模型，实时显示每个供应商的模型数）
 - 保存 / 清空 / 停用·启用，点一下立即生效（与 `model_failover` 工具共用同一份状态）
-- 查看当前池大小与最近几次转移事件
+- 查看池内每个模型的状态徽标（🟢 今日可用 / 🔴 熔断冷却中带倒计时 / ⚪ 未试）与熔断策略、最近几次转移事件
 
 数据与操作走宿主同源路由 `GET /api/model-failover/status`、`POST /api/model-failover/{set,clear,toggle}`。
 新增/修改 Client 代码后需要重启 DSH 并刷新页面（桌面端不做热加载）。
@@ -115,3 +126,4 @@ node --test test/unit.mjs
 ## License
 
 MIT
+
