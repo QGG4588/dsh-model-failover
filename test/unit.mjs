@@ -447,7 +447,7 @@ test("llm/stream: 成功 finish 记录今日可用", async () => {
   await mod.apply(ctx, { providers: ["wb"] }, internals);
   const llmHook = ctx._hooks.get("llm/stream");
   assert.ok(llmHook, "llm/stream 观察者应注册");
-  const stream = await llmHook({ provider: "wb", model: "cn:a" }, async () => (async function* () {
+  const stream = llmHook({ provider: "wb", model: "cn:a" }, () => (async function* () {
     yield { type: "finish", reason: { kind: "stop" } };
   })());
   const chunks = [];
@@ -456,3 +456,24 @@ test("llm/stream: 成功 finish 记录今日可用", async () => {
   const { json } = await callRoute(ctx, "/api/model-failover/status");
   assert.ok(json.success["wb/cn:a"], "成功路由应标记可用");
 });
+
+test("llm/stream: 必须同步返回 AsyncIterable（否则上游 yield* next() 崩溃）", async () => {
+  const { ctx, internals } = fakeCtxWithWeb({ catalog: { groups: GROUPS } });
+  await mod.apply(ctx, { providers: ["wb"] }, internals);
+  const llmHook = ctx._hooks.get("llm/stream");
+  // 同步调用：监听器不得是 async 函数，否则返回 Promise；上游
+  // dsh-session-checkpoint-policy 的 afterCheckpoint 会 `yield* next()`，
+  // 对 Promise 做 yield* 抛 “yield* (intermediate value) is not async iterable”，整轮请求失败。
+  const ret = llmHook({ provider: "wb", model: "cn:a" }, () => (async function* () {
+    yield { type: "finish", reason: { kind: "stop" } };
+  })());
+  assert.equal(typeof ret?.then, "undefined", "llm/stream 监听器不能声明为 async");
+  assert.equal(typeof ret?.[Symbol.asyncIterator], "function", "应直接返回 AsyncIterable");
+  // 复刻 afterCheckpoint 的包装方式
+  const wrapped = (async function* () { yield* ret; })();
+  const chunks = [];
+  for await (const c of wrapped) chunks.push(c);
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].type, "finish");
+});
+

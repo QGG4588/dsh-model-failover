@@ -455,13 +455,21 @@ export async function apply(ctx, config = {}, internals = {}) {
     }
   });
 
-  // llm/stream：只观察不改写 —— 终态 finish 为成功时记录「今日可用」并清除该路由熔断。
-  ctx.on("llm/stream", async (options, next) => {
-    const stream = await next();
-    if (!cfg.enabled || !options?.provider || !options?.model) return stream;
-    const provider = String(options.provider);
-    const model = String(options.model);
+  // 【必须同步返回 AsyncIterable】瀑布监听器若声明成 async，返回值就是 Promise；
+  // 上游 dsh-session-checkpoint-policy 的 afterCheckpoint 会 `yield* next()`，
+  // 对 Promise 做 yield* 直接抛 “yield* (intermediate value) is not async iterable”，
+  // 整轮对话在发出请求的瞬间失败（请求头已落盘、stream 为空）。
+  // 因此这里保持同步函数，把 await 放进生成器内部；下游若也返回 Promise 一并 await 兼容。
+  ctx.on("llm/stream", (options, next) => {
+    const downstream = next();
+    const provider = options?.provider === undefined ? "" : String(options.provider);
+    const model = options?.model === undefined ? "" : String(options.model);
     return (async function* () {
+      const stream = await downstream;
+      if (!cfg.enabled || !provider || !model) {
+        for await (const chunk of stream) yield chunk;
+        return;
+      }
       for await (const chunk of stream) {
         try {
           if (chunk && chunk.type === "finish") {
@@ -727,3 +735,4 @@ export const _internals = { DEFAULT_RETRYABLE_CODES, applyRoute, buildPool, isRe
 export function resetStateCacheForTest() {
   stateCache = { mtimeMs: -1, size: -1, state: null };
 }
+
